@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IRA Tracker — Aladin Zahran</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-left">
+      <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+      </svg>
+      <span class="header-title">IRA Tracker</span>
+      <span class="header-user">Aladin Zahran</span>
+    </div>
+    <div class="header-right">
+      <button class="iran-alert-btn" id="iranAlertBtn">
+        <span class="pulse-dot"></span>
+        IRAN WAR ALERT
+      </button>
+      <div class="snapshot-badge">
+        <span class="live-dot"></span>
+        <span id="snapshotTime">Snapshot — Loading…</span>
+      </div>
+      <button class="theme-toggle" id="themeToggle" title="Toggle theme">☽</button>
+    </div>
+  </header>
+
+  <!-- LAYOUT -->
+  <div class="layout">
+    <!-- SIDEBAR -->
+    <nav class="sidebar">
+      <div class="sidebar-section-label">PORTFOLIOS</div>
+      <ul class="sidebar-nav">
+        <li><a href="#" class="nav-link active" data-page="overview">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          Overview
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="traditional">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></svg>
+          Traditional IRA
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="rollover">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+          Rollover IRA
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="roth">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          Roth IRA
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="investments">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+          Investments
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="income">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          Income Strategy
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="rebalance">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+          Rebalance Calc
+        </a></li>
+      </ul>
+
+      <div class="rebalance-countdown">
+        <div class="rc-label">Rebalance Countdown</div>
+        <div class="rc-days" id="rebalanceDays">--</div>
+        <div class="rc-sublabel">days</div>
+        <div class="rc-target">Target: June 1, 2026</div>
+      </div>
+
+      <div class="sidebar-section-label" style="margin-top:1.5rem">BENCHMARKS</div>
+      <ul class="sidebar-nav">
+        <li><a href="#" class="nav-link" data-page="benchmarks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+          vs Dow / S&amp;P / NASDAQ / Gold
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="alerts">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+          Iran Crisis Alerts
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="dividends">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          Dividend Calendar
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="insights">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+          Portfolio Insights
+        </a></li>
+      </ul>
+    </nav>
+
+    <!-- MAIN CONTENT -->
+    <main class="main-content" id="mainContent">
+      <!-- Pages injected by JS -->
+    </main>
+  </div>
+
+  <!-- IRAN ALERT MODAL -->
+  <div class="modal-overlay" id="iranModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">
+          <span class="alert-icon">⚠</span>
+          OPERATION EPIC FURY — Active War Alert
+        </div>
+        <button class="modal-close" id="modalClose">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-meta">Updated Mar 26, 2026 · Sources: Bloomberg, UBS CIO, ACLED, Britannica, Al Jazeera</div>
+
+        <div class="alert-item critical">
+          <span class="severity-badge critical">CRITICAL</span>
+          <div class="alert-content">
+            <strong>Strait of Hormuz partially blockaded.</strong> Iran preventing tanker passage; ~20% of global oil supply affected. Dubai/Doha airports suspended at peak. Ali Larijani confirmed killed Mar 18.
+            <div class="alert-source">Mar 18, 2026 · Bloomberg</div>
+          </div>
+        </div>
+        <div class="alert-item high">
+          <span class="severity-badge high">HIGH</span>
+          <div class="alert-content">
+            <strong>Commodity surge:</strong> PDBC +28.24% since Dec 17. Gold (GLD) +5.57% 90-day. UBS favors actively managed commodity strategies given volatility.
+            <div class="alert-source">Mar 2, 2026 · UBS Global CIO</div>
+          </div>
+        </div>
+        <div class="alert-item medium">
+          <span class="severity-badge medium">MEDIUM</span>
+          <div class="alert-content">
+            <strong>Market risk premium repriced:</strong> PRS Group ICRG data shows 106bps sovereign spread increase per 10-pt political stability drop. Al Jazeera warns of global recession risk if Hormuz stays blocked.
+            <div class="alert-source">Mar 17, 2026 · PRS Group / Al Jazeera</div>
+          </div>
+        </div>
+
+        <div class="modal-impact">
+          <h4>Portfolio Impact Assessment</h4>
+          <div class="impact-grid">
+            <div class="impact-card positive">
+              <div class="impact-ticker">PDBC</div>
+              <div class="impact-val">+28.24%</div>
+              <div class="impact-desc">Commodity hedge — direct beneficiary</div>
+            </div>
+            <div class="impact-card positive">
+              <div class="impact-ticker">GLDM</div>
+              <div class="impact-val">+12.41%</div>
+              <div class="impact-desc">Crisis hedge performing as expected</div>
+            </div>
+            <div class="impact-card neutral">
+              <div class="impact-ticker">VTIP</div>
+              <div class="impact-val">+1.8%</div>
+              <div class="impact-desc">Inflation protection activated</div>
+            </div>
+            <div class="impact-card negative">
+              <div class="impact-ticker">XLK</div>
+              <div class="impact-val">-3.2%</div>
+              <div class="impact-desc">Tech under pressure — monitor</div>
+            </div>
+          </div>
+          <div class="modal-recommendation">
+            <strong>Recommendation:</strong> Hold current allocation through June 1 rebalance. PDBC and GLDM are doing their job. Consider trimming PDBC by ~2% at rebalance if commodities remain elevated.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
