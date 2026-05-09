@@ -21,7 +21,8 @@
  *
  * PORTABILITY
  *   Copy or share this file to move your data to another machine.
- *   No browser storage (localStorage) is used — this file IS the data.
+ *   The app also keeps a browser-side backup so edits survive refreshes,
+ *   but this file remains the portable source you can export or replace.
  */
 
 window.PORTFOLIO_USER_DATA = {

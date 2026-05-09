@@ -31,7 +31,7 @@ IRA_Tracker_Dashboard/
 └── styles.css      # Dark-theme design system + all component styles
 ```
 
-> **No server needed.** The app runs entirely client-side. All data lives in `app.js`.
+> **No server needed.** The app runs entirely client-side. Edits are saved in the browser for convenience, and `portfolio-data.js` remains the portable source file you can export or replace.
 
 ---
 

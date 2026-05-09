@@ -81,6 +81,8 @@ const ALL_TICKERS = [
   'JEPI','BIL',
 ];
 
+const PORTFOLIO_STORAGE_KEY = 'ira-tracker-dashboard.portfolio-data.v1';
+
 // ─── STATE ──────────────────────────────────────────────────────────────────────
 const state = {
   prices: {},           // ticker -> { price, dayChange, dayChangePct, name }
@@ -464,12 +466,32 @@ function applyDataPayload(payload) {
   syncTickerCatalog();
 }
 
+function readStoredPortfolioData() {
+  try {
+    const raw = localStorage.getItem(PORTFOLIO_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredPortfolioData(payload) {
+  try {
+    localStorage.setItem(PORTFOLIO_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage failures and keep the file/export flow working.
+  }
+}
+
 function savePortfolioData() {
-  // Write changes back into the in-memory window.PORTFOLIO_USER_DATA object.
-  // To persist across page reloads: click "Export portfolio-data.js" in the editor.
+  // Write changes back into the in-memory window.PORTFOLIO_USER_DATA object and
+  // keep a browser-side backup so edits survive reloads.
   const payload = buildExportData();
   if (!window.PORTFOLIO_USER_DATA || typeof window.PORTFOLIO_USER_DATA !== 'object') {
     window.PORTFOLIO_USER_DATA = deepClone(payload);
+    writeStoredPortfolioData(payload);
     return;
   }
   if (!window.PORTFOLIO_USER_DATA._meta || typeof window.PORTFOLIO_USER_DATA._meta !== 'object') {
@@ -480,16 +502,19 @@ function savePortfolioData() {
   window.PORTFOLIO_USER_DATA.accountValues = payload.accountValues;
   window.PORTFOLIO_USER_DATA.holdings = payload.holdings;
   window.PORTFOLIO_USER_DATA.priceOverrides = payload.priceOverrides;
+  writeStoredPortfolioData(payload);
 }
 
 function loadPortfolioData() {
-  const payload = window.PORTFOLIO_USER_DATA;
+  const storedPayload = readStoredPortfolioData();
+  const payload = storedPayload ?? window.PORTFOLIO_USER_DATA;
   if (!payload) {
     syncTickerCatalog();
     return;
   }
   try {
     applyDataPayload(payload);
+    if (!storedPayload) writeStoredPortfolioData(buildExportData());
   } catch {
     applyPortfolioData(deepClone(PORTFOLIOS_DEFAULT));
     syncTickerCatalog();
@@ -615,6 +640,59 @@ function renderEditorRows(portKey) {
   updateEditorTotals();
 }
 
+async function commitEditorPortfolioChanges({ statusPrefix = 'Saved', refreshPrices = true } = {}) {
+  const portKey = state.editorPortfolioKey;
+  const previousTickers = new Set(PORTFOLIOS[portKey].holdings.map(h => String(h.ticker || '').toUpperCase()));
+  const rows = getEditorRows();
+  const accountValue = Number(document.getElementById('editorAccountValue').value || 0);
+
+  if (!rows.length) {
+    setEditorStatus('At least one holding is required.', false);
+    return false;
+  }
+
+  const sanitizedRows = rows.map(r => coerceHolding(r)).filter(Boolean);
+  if (sanitizedRows.length !== rows.length) {
+    setEditorStatus('Each row needs a ticker, name, and valid numeric values.', false);
+    return false;
+  }
+
+  PORTFOLIOS[portKey].accountValue = Number.isFinite(accountValue) && accountValue >= 0 ? accountValue : 0;
+  PORTFOLIOS[portKey].holdings = sanitizedRows;
+
+  // Remove stale overrides for tickers no longer present in this portfolio.
+  previousTickers.forEach(ticker => delete state.priceOverrides[ticker]);
+
+  // Apply / clear price overrides from the editor columns.
+  rows.forEach(row => {
+    if (!row.ticker) return;
+    const p = row.manualPrice;
+    const pc = row.manualPrevClose;
+    if (p != null && Number.isFinite(p) && p > 0) {
+      state.priceOverrides[row.ticker] = {
+        price: p,
+        prevClose: (pc != null && Number.isFinite(pc) && pc > 0) ? pc : null,
+        updatedAt: new Date().toISOString(),
+      };
+    } else {
+      delete state.priceOverrides[row.ticker];
+    }
+  });
+
+  syncTickerCatalog();
+  savePortfolioData();
+
+  let refreshed = true;
+  if (refreshPrices) {
+    try { await loadAllPrices(); } catch { refreshed = false; }
+  }
+
+  const manualCount = Object.keys(state.priceOverrides).length;
+  setEditorStatus(`${statusPrefix} ${sanitizedRows.length} holdings for ${PORTFOLIOS[portKey].name}. Manual overrides: ${manualCount}. Changes are stored in this browser. Live refresh ${refreshed ? 'ok' : 'deferred'}.`, true);
+  renderEditorRows(portKey);
+  return true;
+}
+
 function updateEditorTotals() {
   const rows = getEditorRows();
   const allocTotal = rows.reduce((sum, row) => sum + (Number(row.alloc) || 0), 0);
@@ -629,7 +707,7 @@ function setEditorStatus(message, ok = true) {
   const el = document.getElementById('editorStatus');
   if (!el) return;
   // Preserve hint text in the status container while updating the lead message.
-  const hint = '<span class="editor-persist-hint">Tip: click &ldquo;Export portfolio-data.js&rdquo; after saving to persist changes across reloads.</span>';
+  const hint = '<span class="editor-persist-hint">Tip: saves now persist in this browser, and export remains available for a portable backup.</span>';
   el.innerHTML = `${escAttr(message)} ${hint}`;
   el.classList.toggle('change-up', ok);
   el.classList.toggle('change-down', !ok);
@@ -1490,7 +1568,7 @@ function renderPortfolioEditor() {
           <button id="editorResetAll" class="editor-secondary" type="button">Reset All</button>
         </div>
         <div class="editor-actions editor-file-actions">
-          <button id="editorExportJS" class="calc-btn editor-export-btn" type="button" title="Download an updated portfolio-data.js — replace your current file to persist changes">&#8595; Export portfolio-data.js</button>
+          <button id="editorExportJS" class="calc-btn editor-export-btn" type="button" title="Download an updated portfolio-data.js for portable backup">&#8595; Export portfolio-data.js</button>
           <button id="editorExportJSON" class="editor-secondary" type="button" title="Download a JSON backup you can import on any device">&#8595; Export JSON backup</button>
           <label class="editor-import-label" title="Import a previously exported .js or .json file">
             &#8593; Import file&hellip;
@@ -1498,7 +1576,7 @@ function renderPortfolioEditor() {
           </label>
         </div>
       </div>
-      <div id="editorStatus" class="editor-status">Ready. <span class="editor-persist-hint">Tip: click &ldquo;Export portfolio-data.js&rdquo; after saving to persist changes across reloads.</span></div>
+      <div id="editorStatus" class="editor-status">Ready. <span class="editor-persist-hint">Tip: saves now persist in this browser, and export remains available for a portable backup.</span></div>
     </div>
   `;
 
@@ -1521,56 +1599,14 @@ function renderPortfolioEditor() {
     if (!e.target.classList.contains('editor-remove')) return;
     e.target.closest('tr')?.remove();
     updateEditorTotals();
+    commitEditorPortfolioChanges({ statusPrefix: 'Removed row and saved', refreshPrices: true });
   });
 
   document.getElementById('editorHoldingsBody').addEventListener('input', updateEditorTotals);
 
   document.getElementById('editorSave').addEventListener('click', async () => {
     setEditorStatus('Save started… validating rows.', true);
-    const portKey = state.editorPortfolioKey;
-    const previousTickers = new Set(PORTFOLIOS[portKey].holdings.map(h => String(h.ticker || '').toUpperCase()));
-    const rows = getEditorRows();
-    const accountValue = Number(document.getElementById('editorAccountValue').value || 0);
-    if (!rows.length) {
-      setEditorStatus('At least one holding is required.', false);
-      return;
-    }
-    const sanitizedRows = rows.map(r => coerceHolding(r)).filter(Boolean);
-    if (sanitizedRows.length !== rows.length) {
-      setEditorStatus('Each row needs a ticker, name, and valid numeric values.', false);
-      return;
-    }
-
-    PORTFOLIOS[portKey].accountValue = Number.isFinite(accountValue) && accountValue >= 0 ? accountValue : 0;
-    PORTFOLIOS[portKey].holdings = sanitizedRows;
-
-    // Remove stale overrides for tickers no longer present in this portfolio.
-    previousTickers.forEach(ticker => delete state.priceOverrides[ticker]);
-
-    // Apply / clear price overrides from the editor columns
-    rows.forEach(row => {
-      if (!row.ticker) return;
-      const p = row.manualPrice;
-      const pc = row.manualPrevClose;
-      if (p != null && Number.isFinite(p) && p > 0) {
-        state.priceOverrides[row.ticker] = {
-          price: p,
-          prevClose: (pc != null && Number.isFinite(pc) && pc > 0) ? pc : null,
-          updatedAt: new Date().toISOString(),
-        };
-      } else {
-        delete state.priceOverrides[row.ticker];
-      }
-    });
-
-    syncTickerCatalog();
-    savePortfolioData();
-
-    let refreshed = true;
-    try { await loadAllPrices(); } catch { refreshed = false; }
-    const manualCount = Object.keys(state.priceOverrides).length;
-    setEditorStatus(`Saved ${sanitizedRows.length} holdings for ${PORTFOLIOS[portKey].name}. Manual overrides: ${manualCount}. Live refresh ${refreshed ? 'ok' : 'deferred'}.`, true);
-    renderEditorRows(portKey); // refresh source badges
+    await commitEditorPortfolioChanges({ statusPrefix: 'Saved', refreshPrices: true });
   });
 
   document.getElementById('editorClearOverrideOne').addEventListener('click', () => {
@@ -1613,7 +1649,7 @@ function renderPortfolioEditor() {
     setEditorStatus('Export started: building portfolio-data.js…', true);
     exportPortfolioJS();
     const holdingsTotal = Object.values(PORTFOLIOS).reduce((sum, p) => sum + p.holdings.length, 0);
-    setEditorStatus(`Export complete: portfolio-data.js downloaded (${holdingsTotal} holdings). Replace your existing file to persist.`, true);
+    setEditorStatus(`Export complete: portfolio-data.js downloaded (${holdingsTotal} holdings). Use it as a portable backup or replace your data file.`, true);
   });
 
   document.getElementById('editorExportJSON').addEventListener('click', () => {
@@ -1759,7 +1795,7 @@ function renderRothIRA() {
     </div>
 
     <div class="outperform-banner" style="border-color:rgba(74,158,255,.35);background:rgba(74,158,255,.07);color:var(--accent-blue)">
-      📅 Due for review &amp; rebalancing on <strong>June 1, 2026</strong> — same cycle as all portfolios
+      📅 Due for review &amp; rebalancing on <strong>June 15, 2026</strong> — same cycle as all portfolios
     </div>
 
     <div class="ira-stats-row">
@@ -1786,7 +1822,7 @@ function renderRothIRA() {
     </div>
 
     <div class="outperform-banner" style="border-color:rgba(74,158,255,.35);background:rgba(74,158,255,.07);color:var(--accent-blue)">
-      &#128197; Due for review &amp; rebalancing on <strong>June 1, 2026</strong> — same cycle as all portfolios &nbsp;·&nbsp; <em>2026 Roth contribution limit: $7,000 ($8,000 if age 50+)</em>
+      &#128197; Due for review &amp; rebalancing on <strong>June 15, 2026</strong> — same cycle as all portfolios &nbsp;·&nbsp; <em>2026 Roth contribution limit: $7,000 ($8,000 if age 50+)</em>
     </div>
 
     <div class="ira-charts-row">
@@ -1868,7 +1904,7 @@ function generateInsights() {
   const totalGLAll   = netWorth - totalCostAll;
   const totalGLPct   = totalCostAll > 0 ? (totalGLAll / totalCostAll) * 100 : 0;
   const rebalanceDays = Math.max(0,
-    Math.ceil((new Date('2026-06-01') - new Date()) / (1000 * 86400)));
+    Math.ceil((new Date('2026-06-15') - new Date()) / (1000 * 86400)));
 
   // ── ALERTS ──────────────────────────────────────────────────────────────────
 
@@ -1885,7 +1921,7 @@ function generateInsights() {
         insights.push({
           category: 'alert', icon: '⚖️',
           title:  `${h.ticker} ${dir} in ${port.name}`,
-          body:   `Current allocation ${currentPct.toFixed(1)}% vs ${h.alloc}% target (${sign}${drift.toFixed(1)}pp drift). Consider rebalancing before June 1.`,
+          body:   `Current allocation ${currentPct.toFixed(1)}% vs ${h.alloc}% target (${sign}${drift.toFixed(1)}pp drift). Consider rebalancing before June 15.`,
           action: 'Open Rebalance Calculator', page: 'rebalance'
         });
       }
@@ -1951,7 +1987,7 @@ function generateInsights() {
         insights.push({
           category: 'opportunity', icon: '🔄',
           title:  `${h.ticker} ${sign}${drift.toFixed(1)}pp ${dir} target in ${port.name}`,
-          body:   `Currently ${currentPct.toFixed(1)}% vs ${h.alloc}% target — approaching the 5pp rebalance threshold. Monitor heading into June 1 review.`,
+          body:   `Currently ${currentPct.toFixed(1)}% vs ${h.alloc}% target — approaching the 5pp rebalance threshold. Monitor heading into June 15 review.`,
           action: 'Open Rebalance Calculator', page: 'rebalance'
         });
       }
@@ -1987,7 +2023,7 @@ function generateInsights() {
     insights.push({
       category: 'opportunity', icon: '📅',
       title:  `Rebalance in ${rebalanceDays} Days — Start Reviewing Now`,
-      body:   `Scheduled June 1, 2026. With ${rebalanceDays} days left, finalize target adjustments and review capital gains implications before acting.`,
+      body:   `Scheduled June 15, 2026. With ${rebalanceDays} days left, finalize target adjustments and review capital gains implications before acting.`,
       action: 'Open Rebalance Calculator', page: 'rebalance'
     });
   }
@@ -2076,7 +2112,7 @@ function generateInsights() {
   if (rebalanceDays > 45) {
     insights.push({
       category: 'info', icon: '📅',
-      title:  `Next Rebalance in ${rebalanceDays} Days — June 1, 2026`,
+      title:  `Next Rebalance in ${rebalanceDays} Days — June 15, 2026`,
       body:   `Monitor allocation drift in the Rebalance Calculator. This Insights page will surface any holdings crossing the 5pp alert threshold automatically.`,
       action: 'Open Rebalance Calculator', page: 'rebalance'
     });
@@ -2758,7 +2794,7 @@ function updateSnapshotTime() {
 }
 
 function calcRebalanceDays() {
-  const target = new Date('2026-06-01');
+  const target = new Date('2026-06-15');
   const now    = new Date();
   const days   = Math.max(0, Math.ceil((target - now) / (1000 * 86400)));
   document.getElementById('rebalanceDays').textContent = days;
