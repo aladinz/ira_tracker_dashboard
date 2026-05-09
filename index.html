@@ -18,6 +18,15 @@
       <span class="header-user">Aladin Zahran</span>
     </div>
     <div class="header-right">
+      <button class="header-action" id="refreshMarketsBtn" title="Refresh market prices now">
+        <span class="btn-spinner" aria-hidden="true"></span>
+        <span class="btn-label">Refresh Markets</span>
+      </button>
+      <button class="header-action" id="refreshNewsBtn" title="Refresh war headlines now">
+        <span class="btn-spinner" aria-hidden="true"></span>
+        <span class="btn-label">Refresh News</span>
+      </button>
+      <div class="diag-strip" id="diagStrip" title="Live diagnostics">Bench --/-- · Holdings --/-- · News --</div>
       <button class="iran-alert-btn" id="iranAlertBtn">
         <span class="pulse-dot"></span>
         IRAN WAR ALERT
@@ -63,6 +72,10 @@
         <li><a href="#" class="nav-link" data-page="rebalance">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
           Rebalance Calc
+        </a></li>
+        <li><a href="#" class="nav-link" data-page="editor">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 1 1 3 3L7 19l-4 1 1-4Z"/></svg>
+          Edit Portfolio
         </a></li>
       </ul>
 
@@ -111,29 +124,8 @@
         <button class="modal-close" id="modalClose">✕</button>
       </div>
       <div class="modal-body">
-        <div class="modal-meta">Updated Mar 26, 2026 · Sources: Bloomberg, UBS CIO, ACLED, Britannica, Al Jazeera</div>
-
-        <div class="alert-item critical">
-          <span class="severity-badge critical">CRITICAL</span>
-          <div class="alert-content">
-            <strong>Strait of Hormuz partially blockaded.</strong> Iran preventing tanker passage; ~20% of global oil supply affected. Dubai/Doha airports suspended at peak. Ali Larijani confirmed killed Mar 18.
-            <div class="alert-source">Mar 18, 2026 · Bloomberg</div>
-          </div>
-        </div>
-        <div class="alert-item high">
-          <span class="severity-badge high">HIGH</span>
-          <div class="alert-content">
-            <strong>Commodity surge:</strong> PDBC +28.24% since Dec 17. Gold (GLD) +5.57% 90-day. UBS favors actively managed commodity strategies given volatility.
-            <div class="alert-source">Mar 2, 2026 · UBS Global CIO</div>
-          </div>
-        </div>
-        <div class="alert-item medium">
-          <span class="severity-badge medium">MEDIUM</span>
-          <div class="alert-content">
-            <strong>Market risk premium repriced:</strong> PRS Group ICRG data shows 106bps sovereign spread increase per 10-pt political stability drop. Al Jazeera warns of global recession risk if Hormuz stays blocked.
-            <div class="alert-source">Mar 17, 2026 · PRS Group / Al Jazeera</div>
-          </div>
-        </div>
+        <div class="modal-meta" id="warModalMeta">Loading latest conflict headlines...</div>
+        <div id="warModalAlerts"></div>
 
         <div class="modal-impact">
           <h4>Portfolio Impact Assessment</h4>
@@ -167,6 +159,7 @@
     </div>
   </div>
 
+  <script src="portfolio-data.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

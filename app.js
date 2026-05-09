@@ -65,6 +65,8 @@ const PORTFOLIOS = {
   }
 };
 
+const PORTFOLIOS_DEFAULT = JSON.parse(JSON.stringify(PORTFOLIOS));
+
 const BENCHMARKS = {
   '^DJI':  { label: 'DOW JONES',  range52: '36,611.78 – 50,512.79', base90: 46266.59 },
   '^GSPC': { label: 'S&P 500',    range52: '4,835.04 – 7,002.28',   base90: 6539.84  },
@@ -81,34 +83,161 @@ const ALL_TICKERS = [
 
 // ─── STATE ──────────────────────────────────────────────────────────────────────
 const state = {
-  prices: {},       // ticker -> { price, dayChange, dayChangePct, name }
-  bench:  {},       // key -> { price, dayChange, dayChangePct }
-  charts: {},       // id -> Chart instance
+  prices: {},           // ticker -> { price, dayChange, dayChangePct, name }
+  bench:  {},           // key -> { price, dayChange, dayChangePct }
+  charts: {},           // id -> Chart instance
   currentPage: 'overview',
+  editorPortfolioKey: 'traditional',
+  priceOverrides: {},   // ticker -> { price, prevClose, updatedAt } — from portfolio-data.js or editor
+  diagnostics: {
+    lastMarketsRefreshAt: null,
+    lastNewsRefreshAt: null,
+    lastMarketsError: null,
+    lastNewsError: null,
+  },
+  warNews: {
+    items: [],
+    updatedAt: null,
+    source: 'Seeded conflict updates',
+    live: false,
+  },
 };
+
+const WAR_NEWS_QUERY = 'https://news.google.com/rss/search?q=Iran+OR+Israel+OR+Hormuz+war+when:7d&hl=en-US&gl=US&ceid=US:en';
+const WAR_NEWS_PROXY_BASES = [
+  'https://corsproxy.io/?',
+  'https://api.allorigins.win/raw?url=',
+];
+const WAR_NEWS_FALLBACK = [
+  {
+    severity: 'critical',
+    headline: 'Strait of Hormuz shipping disruption risk remains elevated.',
+    source: 'Seeded alert',
+    publishedAt: 'Recent',
+  },
+  {
+    severity: 'high',
+    headline: 'Commodity volatility is still elevated across oil, shipping, and metals.',
+    source: 'Seeded alert',
+    publishedAt: 'Recent',
+  },
+  {
+    severity: 'medium',
+    headline: 'Global risk sentiment remains sensitive to new Middle East developments.',
+    source: 'Seeded alert',
+    publishedAt: 'Recent',
+  },
+];
 
 // ─── YAHOO FINANCE PROXY ────────────────────────────────────────────────────────
 // Uses a CORS proxy to fetch Yahoo Finance quote data.
 // In a production deployment replace with your own backend endpoint.
 const YF_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart/';
+const YF_PROXY_BASES = [
+  'https://corsproxy.io/?',
+  'https://api.allorigins.win/raw?url=',
+];
+const FETCH_TIMEOUT_MS = 12000;
+
+function asFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchJSON(url) {
+  const withTimeout = async (targetUrl) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      return await fetch(targetUrl, { mode: 'cors', cache: 'no-store', signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const isLocalHttp =
+    typeof window !== 'undefined' &&
+    window.location?.protocol?.startsWith('http') &&
+    (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost');
+  const isYahooQuote = url.startsWith(YF_BASE);
+
+  // On localhost dev servers, Yahoo chart endpoints are commonly blocked by CORS.
+  // Skip direct fetch there and go straight to proxy fallbacks.
+  const shouldTryDirectFirst = !(isLocalHttp && isYahooQuote);
+
+  let directStatus = 'n/a';
+  if (shouldTryDirectFirst) {
+    try {
+      const direct = await withTimeout(url);
+      directStatus = String(direct.status);
+      if (direct.ok) return direct.json();
+    } catch {
+      // ignore and continue to proxy fallback
+    }
+  }
+
+  // Some browsers/loading contexts can fail direct CORS.
+  // Try multiple proxies so one temporary outage does not break live updates.
+  const ts = Date.now();
+  let lastProxyStatus = 'n/a';
+  for (const base of YF_PROXY_BASES) {
+    try {
+      const separator = base.includes('?') ? '&' : '?';
+      const proxiedUrl = `${base}${encodeURIComponent(url)}${separator}_=${ts}`;
+      const proxied = await withTimeout(proxiedUrl);
+      lastProxyStatus = String(proxied.status);
+      if (proxied.ok) return proxied.json();
+    } catch {
+      // try next proxy
+    }
+  }
+
+  throw new Error(`HTTP ${directStatus}/${lastProxyStatus}`);
+}
+
+async function loadBenchmarkPrices() {
+  const symbols = Object.keys(BENCHMARKS);
+  await Promise.allSettled(
+    symbols.map(async sym => {
+      try {
+        const q = await fetchQuote(sym);
+        state.bench[sym] = q;
+      } catch {
+        if (!state.bench[sym] && BENCH_SEED[sym]) {
+          state.bench[sym] = { ...BENCH_SEED[sym], usedSeed: true };
+        }
+      }
+    })
+  );
+}
 
 async function fetchQuote(symbol) {
   const url = `${YF_BASE}${encodeURIComponent(symbol)}?interval=1d&range=3mo`;
-  const resp = await fetch(url, { mode: 'cors' });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const json = await resp.json();
-  const meta  = json.chart.result[0].meta;
-  const close = json.chart.result[0].indicators.quote[0].close;
-  const adjClose = close.filter(v => v != null);
-  const price     = meta.regularMarketPrice ?? adjClose[adjClose.length - 1];
-  const prevClose = meta.previousClose ?? meta.chartPreviousClose;
+  const json = await fetchJSON(url);
+  const result = json?.chart?.result?.[0];
+  if (!result?.meta || !result?.indicators?.quote?.[0]?.close) throw new Error('Malformed quote response');
+
+  const meta = result.meta;
+  const closes = result.indicators.quote[0].close
+    .map(v => asFiniteNumber(v))
+    .filter(v => v != null);
+  if (!closes.length) throw new Error('No close data');
+
+  const latestClose = closes[closes.length - 1];
+  const previousFromSeries = closes.length > 1 ? closes[closes.length - 2] : latestClose;
+  const price = asFiniteNumber(meta.regularMarketPrice) ?? latestClose;
+  const prevClose =
+    asFiniteNumber(meta.previousClose) ??
+    asFiniteNumber(meta.chartPreviousClose) ??
+    previousFromSeries ??
+    price;
   const dayChange    = price - prevClose;
-  const dayChangePct = (dayChange / prevClose) * 100;
+  const dayChangePct = prevClose !== 0 ? (dayChange / prevClose) * 100 : 0;
 
   // 90-day return (base=100)
-  const startPrice = adjClose[0];
-  const series90 = adjClose.map(v => v != null ? (v / startPrice) * 100 : null);
-  const timestamps = json.chart.result[0].timestamp;
+  const startPrice = closes[0];
+  const series90 = closes.map(v => (v / startPrice) * 100);
+  const timestamps = result.timestamp ?? [];
 
   return { price, prevClose, dayChange, dayChangePct, series90, timestamps, symbol };
 }
@@ -202,6 +331,458 @@ function fmtN(n)   { return n.toLocaleString('en-US', {minimumFractionDigits:2,m
 function pColor(n) { return n >= 0 ? 'change-up' : 'change-down'; }
 function signedDollar(n) { return (n >= 0 ? '+$' : '-$') + Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:0,maximumFractionDigits:0}); }
 
+// Returns today as "May 7, 2026"
+function todayLabel() {
+  return new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+// Returns the date N days before today as "Feb 6, 2026"
+function daysAgoLabel(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+// "Feb 6, 2026 – May 7, 2026"
+function window90Label() { return `${daysAgoLabel(90)} \u2013 ${todayLabel()}`; }
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+function escAttr(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function coerceHolding(raw, fallback = null) {
+  const ticker = String(raw?.ticker ?? fallback?.ticker ?? '').trim().toUpperCase();
+  const name = String(raw?.name ?? fallback?.name ?? '').trim();
+  const alloc = Number(raw?.alloc ?? fallback?.alloc ?? 0);
+  const shares = Number(raw?.shares ?? fallback?.shares ?? 0);
+  const costBasis = Number(raw?.costBasis ?? fallback?.costBasis ?? 0);
+  if (!ticker || !name || Number.isNaN(alloc) || Number.isNaN(shares) || Number.isNaN(costBasis)) return null;
+  return {
+    ticker,
+    name,
+    alloc: Math.max(0, alloc),
+    shares: Math.max(0, shares),
+    costBasis: Math.max(0, costBasis),
+  };
+}
+
+function sanitizePortfolioData(raw) {
+  const clean = {};
+  for (const [key, base] of Object.entries(PORTFOLIOS_DEFAULT)) {
+    const source = raw?.[key] ?? {};
+    const accountValue = Number(source.accountValue);
+    const holdings = Array.isArray(source.holdings)
+      ? source.holdings.map(h => coerceHolding(h)).filter(Boolean)
+      : deepClone(base.holdings);
+    clean[key] = {
+      name: base.name,
+      accountValue: Number.isFinite(accountValue) && accountValue >= 0 ? accountValue : base.accountValue,
+      holdings: holdings.length ? holdings : deepClone(base.holdings),
+    };
+  }
+  return clean;
+}
+
+function applyPortfolioData(clean) {
+  for (const key of Object.keys(PORTFOLIOS)) {
+    PORTFOLIOS[key].accountValue = clean[key].accountValue;
+    PORTFOLIOS[key].holdings = clean[key].holdings;
+  }
+}
+
+function syncTickerCatalog() {
+  const activeTickers = new Set();
+  Object.values(PORTFOLIOS).forEach(port => {
+    port.holdings.forEach(h => {
+      if (h.ticker) activeTickers.add(h.ticker.toUpperCase());
+    });
+  });
+
+  activeTickers.forEach(ticker => {
+    if (!ALL_TICKERS.includes(ticker)) ALL_TICKERS.push(ticker);
+    if (!SEED[ticker]) {
+      const live = state.prices[ticker];
+      SEED[ticker] = {
+        price: live?.price ?? 0,
+        dayChange: live?.dayChange ?? 0,
+        dayChangePct: live?.dayChangePct ?? 0,
+        return90: 0,
+      };
+    }
+    if (!DIV_INFO[ticker]) {
+      DIV_INFO[ticker] = { freq: 'none', payMonths: [], aps: 0 };
+    }
+  });
+}
+
+// ─── FILE-BASED DATA LAYER (replaces localStorage) ──────────────────────────────
+
+function buildExportData() {
+  const accountValues = {};
+  const holdings = {};
+  Object.keys(PORTFOLIOS).forEach(key => {
+    accountValues[key] = PORTFOLIOS[key].accountValue;
+    holdings[key] = PORTFOLIOS[key].holdings;
+  });
+  return {
+    _meta: { version: 1, lastUpdated: new Date().toISOString() },
+    accountValues,
+    holdings,
+    priceOverrides: deepClone(state.priceOverrides),
+  };
+}
+
+function applyDataPayload(payload) {
+  for (const key of Object.keys(PORTFOLIOS_DEFAULT)) {
+    const av = Number(payload?.accountValues?.[key]);
+    if (Number.isFinite(av) && av >= 0) PORTFOLIOS[key].accountValue = av;
+    const rawHoldings = payload?.holdings?.[key];
+    if (Array.isArray(rawHoldings)) {
+      const cleaned = rawHoldings.map(h => coerceHolding(h)).filter(Boolean);
+      if (cleaned.length) PORTFOLIOS[key].holdings = cleaned;
+    }
+  }
+  state.priceOverrides = {};
+  for (const [ticker, data] of Object.entries(payload?.priceOverrides ?? {})) {
+    const price = Number(data?.price);
+    const prevClose = Number(data?.prevClose);
+    if (Number.isFinite(price) && price > 0) {
+      state.priceOverrides[ticker.toUpperCase()] = {
+        price,
+        prevClose: (Number.isFinite(prevClose) && prevClose > 0) ? prevClose : null,
+        updatedAt: String(data?.updatedAt ?? ''),
+      };
+    }
+  }
+  syncTickerCatalog();
+}
+
+function savePortfolioData() {
+  // Write changes back into the in-memory window.PORTFOLIO_USER_DATA object.
+  // To persist across page reloads: click "Export portfolio-data.js" in the editor.
+  const payload = buildExportData();
+  if (!window.PORTFOLIO_USER_DATA || typeof window.PORTFOLIO_USER_DATA !== 'object') {
+    window.PORTFOLIO_USER_DATA = deepClone(payload);
+    return;
+  }
+  if (!window.PORTFOLIO_USER_DATA._meta || typeof window.PORTFOLIO_USER_DATA._meta !== 'object') {
+    window.PORTFOLIO_USER_DATA._meta = { version: 1, lastUpdated: payload._meta.lastUpdated };
+  }
+  window.PORTFOLIO_USER_DATA._meta.version = Number(window.PORTFOLIO_USER_DATA._meta.version) || 1;
+  window.PORTFOLIO_USER_DATA._meta.lastUpdated = payload._meta.lastUpdated;
+  window.PORTFOLIO_USER_DATA.accountValues = payload.accountValues;
+  window.PORTFOLIO_USER_DATA.holdings = payload.holdings;
+  window.PORTFOLIO_USER_DATA.priceOverrides = payload.priceOverrides;
+}
+
+function loadPortfolioData() {
+  const payload = window.PORTFOLIO_USER_DATA;
+  if (!payload) {
+    syncTickerCatalog();
+    return;
+  }
+  try {
+    applyDataPayload(payload);
+  } catch {
+    applyPortfolioData(deepClone(PORTFOLIOS_DEFAULT));
+    syncTickerCatalog();
+  }
+}
+
+function resetPortfolioData(portKey = null) {
+  if (portKey && PORTFOLIOS_DEFAULT[portKey]) {
+    PORTFOLIOS[portKey].accountValue = PORTFOLIOS_DEFAULT[portKey].accountValue;
+    PORTFOLIOS[portKey].holdings = deepClone(PORTFOLIOS_DEFAULT[portKey].holdings);
+    PORTFOLIOS_DEFAULT[portKey].holdings.forEach(h => delete state.priceOverrides[h.ticker]);
+  } else {
+    applyPortfolioData(deepClone(PORTFOLIOS_DEFAULT));
+    state.priceOverrides = {};
+  }
+  syncTickerCatalog();
+  savePortfolioData();
+}
+
+function exportPortfolioJS() {
+  savePortfolioData();
+  const payload = buildExportData();
+  const content = `/* portfolio-data.js — IRA Tracker Dashboard · Generated ${payload._meta.lastUpdated}
+ * Replace your portfolio-data.js file with this content to persist changes.
+ * See the original file header for usage instructions.
+ */
+window.PORTFOLIO_USER_DATA = ${JSON.stringify(payload, null, 2)};
+`;
+  triggerDownload(content, 'portfolio-data.js', 'text/javascript');
+}
+
+function exportPortfolioJSON() {
+  savePortfolioData();
+  const payload = buildExportData();
+  triggerDownload(JSON.stringify(payload, null, 2), 'portfolio-data.json', 'application/json');
+}
+
+function triggerDownload(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importPortfolioFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        let payload;
+        const text = String(e.target.result ?? '');
+        const lowerName = file.name.toLowerCase();
+        if (lowerName.endsWith('.js')) {
+          // Accept portfolio-data.js files even if they include comments or extra whitespace.
+          const match = text.match(/window\.PORTFOLIO_USER_DATA\s*=\s*(\{[\s\S]*\})\s*;?/);
+          if (!match) throw new Error('Could not find PORTFOLIO_USER_DATA in the .js file.');
+          payload = JSON.parse(match[1]);
+        } else {
+          payload = JSON.parse(text);
+        }
+        applyDataPayload(payload);
+        savePortfolioData();
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(new Error('File read error'));
+    reader.readAsText(file);
+  });
+}
+
+function editorHoldingRowHTML(h = {}) {
+  const ticker = escAttr(h.ticker ?? '');
+  const name = escAttr(h.name ?? '');
+  const alloc = Number(h.alloc ?? 0);
+  const shares = Number(h.shares ?? 0);
+  const costBasis = Number(h.costBasis ?? 0);
+  const tickerUpper = String(h.ticker ?? '').trim().toUpperCase();
+  const ov = state.priceOverrides[tickerUpper];
+  const manualPrice = ov?.price ?? '';
+  const manualPrevClose = ov?.prevClose ?? '';
+  const source = tickerUpper ? getPriceSource(tickerUpper) : 'seed';
+  return `
+    <tr>
+      <td><input class="editor-input" data-field="ticker" value="${ticker}" placeholder="SCHD" maxlength="12" /></td>
+      <td><input class="editor-input" data-field="name" value="${name}" placeholder="Security name" /></td>
+      <td><input class="editor-input" data-field="alloc" type="number" min="0" step="0.01" value="${alloc}" /></td>
+      <td><input class="editor-input" data-field="shares" type="number" min="0" step="0.001" value="${shares}" /></td>
+      <td><input class="editor-input" data-field="costBasis" type="number" min="0" step="0.01" value="${costBasis}" /></td>
+      <td><input class="editor-input" data-field="manualPrice" type="number" min="0" step="0.01" value="${manualPrice}" placeholder="optional" /></td>
+      <td><input class="editor-input" data-field="manualPrevClose" type="number" min="0" step="0.01" value="${manualPrevClose}" placeholder="optional" /></td>
+      <td><span class="price-source-badge source-${source}">${source.toUpperCase()}</span></td>
+      <td><button class="editor-remove" type="button">Remove</button></td>
+    </tr>`;
+}
+
+function getEditorRows() {
+  const rows = [];
+  document.querySelectorAll('#editorHoldingsBody tr').forEach(tr => {
+    const ticker = tr.querySelector('[data-field="ticker"]')?.value.trim().toUpperCase() ?? '';
+    const name = tr.querySelector('[data-field="name"]')?.value.trim() ?? '';
+    const alloc = Number(tr.querySelector('[data-field="alloc"]')?.value ?? 0);
+    const shares = Number(tr.querySelector('[data-field="shares"]')?.value ?? 0);
+    const costBasis = Number(tr.querySelector('[data-field="costBasis"]')?.value ?? 0);
+    const manualPriceRaw = tr.querySelector('[data-field="manualPrice"]')?.value.trim();
+    const manualPrevCloseRaw = tr.querySelector('[data-field="manualPrevClose"]')?.value.trim();
+    const manualPrice = manualPriceRaw ? Number(manualPriceRaw) : null;
+    const manualPrevClose = manualPrevCloseRaw ? Number(manualPrevCloseRaw) : null;
+    if (!ticker && !name && alloc === 0 && shares === 0 && costBasis === 0) return;
+    rows.push({ ticker, name, alloc, shares, costBasis, manualPrice, manualPrevClose });
+  });
+  return rows;
+}
+
+function renderEditorRows(portKey) {
+  const tbody = document.getElementById('editorHoldingsBody');
+  if (!tbody) return;
+  tbody.innerHTML = PORTFOLIOS[portKey].holdings.map(editorHoldingRowHTML).join('');
+  updateEditorTotals();
+}
+
+function updateEditorTotals() {
+  const rows = getEditorRows();
+  const allocTotal = rows.reduce((sum, row) => sum + (Number(row.alloc) || 0), 0);
+  const allocEl = document.getElementById('editorAllocTotal');
+  if (!allocEl) return;
+  allocEl.textContent = `${allocTotal.toFixed(2)}%`;
+  allocEl.classList.toggle('change-up', Math.abs(allocTotal - 100) < 0.01);
+  allocEl.classList.toggle('change-down', Math.abs(allocTotal - 100) >= 0.01);
+}
+
+function setEditorStatus(message, ok = true) {
+  const el = document.getElementById('editorStatus');
+  if (!el) return;
+  // Preserve hint text in the status container while updating the lead message.
+  const hint = '<span class="editor-persist-hint">Tip: click &ldquo;Export portfolio-data.js&rdquo; after saving to persist changes across reloads.</span>';
+  el.innerHTML = `${escAttr(message)} ${hint}`;
+  el.classList.toggle('change-up', ok);
+  el.classList.toggle('change-down', !ok);
+}
+
+function inferWarSeverity(headline) {
+  const h = String(headline || '').toLowerCase();
+  if (/missile|strike|attack|killed|dead|blockade|hormuz|evacuat|airstrike|drone/.test(h)) return 'critical';
+  if (/oil|sanction|shipping|navy|troops|military|conflict|escalat/.test(h)) return 'high';
+  return 'medium';
+}
+
+function formatWarNewsDate(input) {
+  if (!input) return 'Recent';
+  const d = new Date(input);
+  if (Number.isNaN(d.getTime())) return 'Recent';
+  return d.toLocaleString('en-US', {
+    month: 'short', day: 'numeric', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC',
+  }) + ' UTC';
+}
+
+async function fetchWarNews() {
+  const ts = Date.now();
+  let xml = '';
+  let fetched = false;
+
+  for (const base of WAR_NEWS_PROXY_BASES) {
+    try {
+      const separator = base.includes('?') ? '&' : '?';
+      const proxiedUrl = `${base}${encodeURIComponent(WAR_NEWS_QUERY)}${separator}_=${ts}`;
+      const resp = await fetch(proxiedUrl, { mode: 'cors', cache: 'no-store' });
+      if (!resp.ok) continue;
+      xml = await resp.text();
+      fetched = true;
+      break;
+    } catch {
+      // try next proxy
+    }
+  }
+
+  if (!fetched) throw new Error('Failed to fetch war news feed');
+
+  const doc = new DOMParser().parseFromString(xml, 'text/xml');
+  const rssItems = [...doc.querySelectorAll('item')].slice(0, 8);
+  const news = rssItems.map(item => {
+    const rawTitle = (item.querySelector('title')?.textContent || '').trim();
+    const publishedAt = item.querySelector('pubDate')?.textContent || '';
+
+    // Google News RSS appends source to title as " - Source".
+    const splitIdx = rawTitle.lastIndexOf(' - ');
+    const headline = (splitIdx > 0 ? rawTitle.slice(0, splitIdx) : rawTitle).trim();
+    const source = (splitIdx > 0 ? rawTitle.slice(splitIdx + 3) : 'Google News').trim();
+
+    return {
+      severity: inferWarSeverity(headline),
+      headline,
+      source,
+      publishedAt: formatWarNewsDate(publishedAt),
+    };
+  }).filter(n => n.headline);
+
+  if (!news.length) throw new Error('No news items in RSS feed');
+  return news.slice(0, 3);
+}
+
+function appendWarAlertRow(container, item) {
+  const row = document.createElement('div');
+  row.className = 'alert-row';
+
+  const badge = document.createElement('span');
+  badge.className = `severity-badge ${item.severity}`;
+  badge.textContent = item.severity.toUpperCase();
+
+  const textWrap = document.createElement('div');
+  textWrap.className = 'alert-text';
+  textWrap.textContent = item.headline;
+
+  const source = document.createElement('div');
+  source.className = 'source';
+  source.textContent = `${item.publishedAt} · ${item.source}`;
+  textWrap.appendChild(source);
+
+  row.appendChild(badge);
+  row.appendChild(textWrap);
+  container.appendChild(row);
+}
+
+function appendWarAlertModal(container, item) {
+  const card = document.createElement('div');
+  card.className = `alert-item ${item.severity}`;
+
+  const badge = document.createElement('span');
+  badge.className = `severity-badge ${item.severity}`;
+  badge.textContent = item.severity.toUpperCase();
+
+  const body = document.createElement('div');
+  body.className = 'alert-content';
+  body.textContent = item.headline;
+
+  const source = document.createElement('div');
+  source.className = 'alert-source';
+  source.textContent = `${item.publishedAt} · ${item.source}`;
+  body.appendChild(source);
+
+  card.appendChild(badge);
+  card.appendChild(body);
+  container.appendChild(card);
+}
+
+function renderWarNews() {
+  const items = state.warNews.items.length ? state.warNews.items : WAR_NEWS_FALLBACK;
+  const updatedText = state.warNews.updatedAt
+    ? `Updated ${state.warNews.updatedAt} · Source: ${state.warNews.source}`
+    : 'Using fallback conflict updates';
+
+  const panelMeta = document.getElementById('warPanelMeta');
+  const panelAlerts = document.getElementById('warPanelAlerts');
+  if (panelMeta) panelMeta.textContent = updatedText;
+  if (panelAlerts) {
+    panelAlerts.innerHTML = '';
+    items.forEach(item => appendWarAlertRow(panelAlerts, item));
+  }
+
+  const modalMeta = document.getElementById('warModalMeta');
+  const modalAlerts = document.getElementById('warModalAlerts');
+  if (modalMeta) modalMeta.textContent = updatedText;
+  if (modalAlerts) {
+    modalAlerts.innerHTML = '';
+    items.forEach(item => appendWarAlertModal(modalAlerts, item));
+  }
+}
+
+async function loadWarNews() {
+  try {
+    const latest = await fetchWarNews();
+    state.warNews.items = latest;
+    state.warNews.source = 'Google News RSS';
+    state.warNews.updatedAt = formatWarNewsDate(new Date().toISOString());
+    state.warNews.live = true;
+    state.diagnostics.lastNewsRefreshAt = new Date().toISOString();
+    state.diagnostics.lastNewsError = null;
+  } catch {
+    state.warNews.items = [];
+    state.warNews.source = 'Seeded conflict updates';
+    state.warNews.updatedAt = null;
+    state.warNews.live = false;
+    state.diagnostics.lastNewsError = 'using fallback feed';
+  }
+  renderWarNews();
+  updateDiagnosticsStrip();
+}
+
 // Compute market value, cost basis, and unrealized G/L for all holdings in a portfolio
 function calcPortfolioStats(portKey) {
   const port = PORTFOLIOS[portKey];
@@ -260,16 +841,111 @@ function calcPortfolioAnnualDiv(portKey) {
 }
 
 function getPrice(ticker) {
+  const ov = state.priceOverrides[ticker];
+  if (ov?.price != null) return ov.price;
   const q = state.prices[ticker];
   return q ? q.price : (SEED[ticker]?.price ?? 0);
 }
 function getDayChangePct(ticker) {
+  const ov = state.priceOverrides[ticker];
+  if (ov?.price != null && ov?.prevClose != null && ov.prevClose > 0) {
+    return ((ov.price - ov.prevClose) / ov.prevClose) * 100;
+  }
   const q = state.prices[ticker];
   return q ? q.dayChangePct : (SEED[ticker]?.dayChangePct ?? 0);
 }
 function get90Return(ticker) {
   const q = state.prices[ticker];
   return q ? (q.return90 ?? SEED[ticker]?.return90 ?? 0) : (SEED[ticker]?.return90 ?? 0);
+}
+function getPriceSource(ticker) {
+  if (state.priceOverrides[ticker]?.price != null) return 'manual';
+  if (state.prices[ticker] && !state.prices[ticker].usedSeed) return 'live';
+  return 'seed';
+}
+
+function getBenchSource(symbol) {
+  if (state.bench[symbol] && !state.bench[symbol].usedSeed) return 'live';
+  return 'seed';
+}
+
+function fmtDiagTime(value) {
+  if (!value) return '--';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '--';
+  return d.toLocaleTimeString('en-US', {
+    timeZone: 'UTC',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }) + ' UTC';
+}
+
+function updateDiagnosticsStrip() {
+  const el = document.getElementById('diagStrip');
+  if (!el) return;
+
+  const benchTotal = Object.keys(BENCHMARKS).length;
+  const benchLive = Object.keys(BENCHMARKS)
+    .reduce((sum, symbol) => sum + (getBenchSource(symbol) === 'live' ? 1 : 0), 0);
+
+  const holdingsTotal = ALL_TICKERS.length;
+  const holdingsLive = ALL_TICKERS
+    .reduce((sum, ticker) => sum + (getPriceSource(ticker) === 'live' ? 1 : 0), 0);
+
+  const newsStatus = state.warNews.live ? 'LIVE' : 'SEED';
+  el.textContent = `Bench ${benchLive}/${benchTotal} · Holdings ${holdingsLive}/${holdingsTotal} · News ${newsStatus}`;
+
+  const healthRatio = (benchLive + holdingsLive) / (benchTotal + holdingsTotal || 1);
+  el.classList.remove('good', 'warn', 'bad');
+  if (healthRatio >= 0.75 && state.warNews.live) el.classList.add('good');
+  else if (healthRatio >= 0.35) el.classList.add('warn');
+  else el.classList.add('bad');
+
+  const marketAt = fmtDiagTime(state.diagnostics.lastMarketsRefreshAt);
+  const newsAt = fmtDiagTime(state.diagnostics.lastNewsRefreshAt);
+  const marketErr = state.diagnostics.lastMarketsError ? `\nMarket err: ${state.diagnostics.lastMarketsError}` : '';
+  const newsErr = state.diagnostics.lastNewsError ? `\nNews err: ${state.diagnostics.lastNewsError}` : '';
+  el.title = `Live diagnostics\nMarkets refresh: ${marketAt}\nNews refresh: ${newsAt}${marketErr}${newsErr}`;
+}
+
+function setHeaderButtonBusy(btn, busy) {
+  if (!btn) return;
+  btn.classList.toggle('busy', busy);
+  btn.setAttribute('aria-busy', busy ? 'true' : 'false');
+}
+
+async function refreshMarketsNow() {
+  const btn = document.getElementById('refreshMarketsBtn');
+  setHeaderButtonBusy(btn, true);
+  try {
+    await loadBenchmarkPrices();
+    await loadAllPrices();
+    state.diagnostics.lastMarketsRefreshAt = new Date().toISOString();
+    state.diagnostics.lastMarketsError = null;
+    updateSnapshotTime();
+    navigateTo(state.currentPage);
+  } catch (err) {
+    state.diagnostics.lastMarketsError = err?.message || 'refresh failed';
+    updateDiagnosticsStrip();
+  } finally {
+    setHeaderButtonBusy(btn, false);
+  }
+}
+
+async function refreshNewsNow() {
+  const btn = document.getElementById('refreshNewsBtn');
+  setHeaderButtonBusy(btn, true);
+  try {
+    await loadWarNews();
+    state.diagnostics.lastNewsRefreshAt = new Date().toISOString();
+    state.diagnostics.lastNewsError = null;
+  } catch (err) {
+    state.diagnostics.lastNewsError = err?.message || 'refresh failed';
+    updateDiagnosticsStrip();
+  } finally {
+    setHeaderButtonBusy(btn, false);
+  }
 }
 
 function calcPortfolio90Return(portfolioKey) {
@@ -351,9 +1027,12 @@ function buildNormChart(canvasId) {
   const tradR   = calcPortfolio90Return('traditional');
   const rollR   = calcPortfolio90Return('rollover');
   const rothR   = calcPortfolio90Return('roth');
-  const sp500R  = ((state.bench['^GSPC']?.price ?? 6539.84) / 6539.84 - 1) * 100;
-  const goldR   = ((state.bench['GC=F']?.price  ?? 3082.10) / 3082.10 - 1) * 100;
-  const dowR    = ((state.bench['^DJI']?.price  ?? 46266.59)/ 46266.59 - 1) * 100;
+  // Use curated 90-day reference returns for the benchmark chart lines so the
+  // Y-axis stays consistent regardless of where live prices happen to be today.
+  // Live prices are shown on the benchmark cards; the chart shows the window trend.
+  const sp500R  = -2.22;
+  const goldR   =  4.18;
+  const dowR    = -3.28;
 
   // Deterministic seeded series using fixed seed per portfolio
   const seeded = (ret, seed) => {
@@ -472,6 +1151,10 @@ function renderOverview() {
   const dow    = state.bench['^DJI']  ?? BENCH_SEED['^DJI'];
   const nasdaq = state.bench['^IXIC'] ?? BENCH_SEED['^IXIC'];
   const gold   = state.bench['GC=F']  ?? BENCH_SEED['GC=F'];
+  const dowSource = getBenchSource('^DJI');
+  const sp500Source = getBenchSource('^GSPC');
+  const nasdaqSource = getBenchSource('^IXIC');
+  const goldSource = getBenchSource('GC=F');
 
   const sp500R90 = -2.22;
   const dowR90   = -3.28;
@@ -525,7 +1208,7 @@ function renderOverview() {
   document.getElementById('mainContent').innerHTML = `
     <div class="page-header">
       <h1>Portfolio Overview</h1>
-      <div class="subtitle">All Portfolios · Live prices as of Mar 26, 2026 · 90-day performance</div>
+      <div class="subtitle">All Portfolios · Live prices as of ${todayLabel()} · 90-day performance</div>
     </div>
 
     <!-- Net Worth Banner -->
@@ -573,24 +1256,8 @@ function renderOverview() {
         <span class="war-icon">⚠</span>
         <span class="war-title">OPERATION EPIC FURY — Active War Alert</span>
       </div>
-      <div class="war-meta">Updated Mar 26, 2026 · Sources: Bloomberg, UBS, ACLED, Britannica</div>
-      <div class="war-alerts">
-        <div class="alert-row">
-          <span class="severity-badge critical">CRITICAL</span>
-          <div class="alert-text"><strong>Strait of Hormuz partially blockaded.</strong> Iran preventing tanker passage; ~20% of global oil supply affected. Dubai/Doha airports suspended at peak. Ali Larijani confirmed killed Mar 18.
-            <div class="source">Mar 18, 2026 · Bloomberg</div></div>
-        </div>
-        <div class="alert-row">
-          <span class="severity-badge high">HIGH</span>
-          <div class="alert-text"><strong>Commodity surge:</strong> PDBC +28.24% since Dec 17. Gold (GLD) +5.57% 90-day. UBS favors actively managed commodity strategies given volatility.
-            <div class="source">Mar 2, 2026 · UBS Global CIO</div></div>
-        </div>
-        <div class="alert-row">
-          <span class="severity-badge medium">MEDIUM</span>
-          <div class="alert-text"><strong>Market risk premium repriced:</strong> PRS Group ICRG data shows 106bps sovereign spread increase per 10-pt political stability drop. Al Jazeera warns of global recession risk if Hormuz stays blocked.
-            <div class="source">Mar 17, 2026 · PRS Group / Al Jazeera</div></div>
-        </div>
-      </div>
+      <div class="war-meta" id="warPanelMeta">Loading latest conflict headlines...</div>
+      <div class="war-alerts" id="warPanelAlerts"></div>
     </div>
 
     ${allBeating ? '<div class="outperform-banner">✓ All portfolios outperforming benchmarks over 90 days</div>' : ''}
@@ -598,7 +1265,10 @@ function renderOverview() {
     <!-- Benchmark KPIs -->
     <div class="benchmark-grid">
       <div class="bench-card">
-        <div class="bench-label">DOW JONES</div>
+        <div class="bench-head-row">
+          <div class="bench-label">DOW JONES</div>
+          <span class="bench-source-badge source-${dowSource}">${dowSource.toUpperCase()}</span>
+        </div>
         <div class="bench-price" id="dowPrice">${fmtN(dow.price)}</div>
         <div class="bench-change ${dow.dayChange < 0 ? 'down' : 'up'}">
           ${dow.dayChange < 0 ? '▼' : '▲'} ${Math.abs(dow.dayChange).toFixed(2)} (${Math.abs(dow.dayChangePct).toFixed(2)}%) today
@@ -606,7 +1276,10 @@ function renderOverview() {
         <div class="bench-range">52W: ${BENCHMARKS['^DJI'].range52}</div>
       </div>
       <div class="bench-card">
-        <div class="bench-label">S&P 500</div>
+        <div class="bench-head-row">
+          <div class="bench-label">S&P 500</div>
+          <span class="bench-source-badge source-${sp500Source}">${sp500Source.toUpperCase()}</span>
+        </div>
         <div class="bench-price" id="sp500Price">${fmtN(sp500.price)}</div>
         <div class="bench-change ${sp500.dayChange < 0 ? 'down' : 'up'}">
           ${sp500.dayChange < 0 ? '▼' : '▲'} ${Math.abs(sp500.dayChange).toFixed(2)} (${Math.abs(sp500.dayChangePct).toFixed(2)}%) today
@@ -614,7 +1287,10 @@ function renderOverview() {
         <div class="bench-range">52W: ${BENCHMARKS['^GSPC'].range52}</div>
       </div>
       <div class="bench-card">
-        <div class="bench-label">NASDAQ</div>
+        <div class="bench-head-row">
+          <div class="bench-label">NASDAQ</div>
+          <span class="bench-source-badge source-${nasdaqSource}">${nasdaqSource.toUpperCase()}</span>
+        </div>
         <div class="bench-price" id="nasdaqPrice">${fmtN(nasdaq.price)}</div>
         <div class="bench-change ${nasdaq.dayChange < 0 ? 'down' : 'up'}">
           ${nasdaq.dayChange < 0 ? '▼' : '▲'} ${Math.abs(nasdaq.dayChange).toFixed(2)} (${Math.abs(nasdaq.dayChangePct).toFixed(2)}%) today
@@ -622,7 +1298,10 @@ function renderOverview() {
         <div class="bench-range">52W: ${BENCHMARKS['^IXIC'].range52}</div>
       </div>
       <div class="bench-card">
-        <div class="bench-label">GOLD / OZ</div>
+        <div class="bench-head-row">
+          <div class="bench-label">GOLD / OZ</div>
+          <span class="bench-source-badge source-${goldSource}">${goldSource.toUpperCase()}</span>
+        </div>
         <div class="bench-price" id="goldPrice">${fmtN(gold.price)}</div>
         <div class="bench-change ${gold.dayChange < 0 ? 'down' : 'up'}">
           ${gold.dayChange < 0 ? '▼' : '▲'} ${Math.abs(gold.dayChange).toFixed(2)} (${Math.abs(gold.dayChangePct).toFixed(2)}%) today
@@ -635,12 +1314,12 @@ function renderOverview() {
     <div class="charts-row">
       <div class="chart-card">
         <div class="chart-title">90-Day Normalized Performance</div>
-        <div class="chart-subtitle">Dec 17, 2025 – Mar 26, 2026 · Base = 100</div>
+        <div class="chart-subtitle">${window90Label()} · Base = 100</div>
         <div class="chart-wrap"><canvas id="normChart"></canvas></div>
       </div>
       <div class="chart-card">
         <div class="chart-title">90-Day Weighted Portfolio Return</div>
-        <div class="chart-subtitle">Dec 17, 2025 → Mar 26, 2026 · Allocation-weighted</div>
+        <div class="chart-subtitle">${window90Label()} · Allocation-weighted</div>
         <div class="weighted-bars">
           ${wbars.map(b => `
             <div class="wbar-row">
@@ -753,6 +1432,214 @@ function renderOverview() {
   requestAnimationFrame(() => buildNormChart('normChart'));
 }
 
+function renderPortfolioEditor() {
+  const portOptions = Object.entries(PORTFOLIOS)
+    .map(([key, p]) => `<option value="${key}" ${key === state.editorPortfolioKey ? 'selected' : ''}>${p.name}</option>`)
+    .join('');
+  const current = PORTFOLIOS[state.editorPortfolioKey];
+  const lastUpdated = window.PORTFOLIO_USER_DATA?._meta?.lastUpdated ?? 'never';
+
+  document.getElementById('mainContent').innerHTML = `
+    <div class="page-header">
+      <h1>Edit Portfolio Data</h1>
+      <div class="subtitle">Update holdings, shares, cost basis, and optional manual price overrides.
+        Changes are in memory until you <strong>Export portfolio-data.js</strong> and replace the file.
+        Last file update: <span class="text-muted">${lastUpdated}</span>
+      </div>
+    </div>
+
+    <div class="holdings-card">
+      <div class="holdings-card-header editor-toolbar">
+        <div class="editor-toolbar-row">
+          <label for="editorPortfolioSelect">Portfolio</label>
+          <select id="editorPortfolioSelect" class="editor-select">${portOptions}</select>
+        </div>
+        <div class="editor-toolbar-row">
+          <label for="editorAccountValue">Account Value ($)</label>
+          <input id="editorAccountValue" class="editor-input editor-acct" type="number" min="0" step="0.01" value="${current.accountValue}" />
+        </div>
+      </div>
+
+      <div class="holdings-tbl-wrap">
+        <table class="holdings-table editor-table">
+          <thead>
+            <tr>
+              <th>TICKER</th>
+              <th>NAME</th>
+              <th>ALLOC %</th>
+              <th>SHARES</th>
+              <th>COST BASIS</th>
+              <th title="Optional: override the live market price for this ticker">MKT PRICE</th>
+              <th title="Optional: override the previous close (needed for Today P&amp;L with manual price)">PREV CLOSE</th>
+              <th>SOURCE</th>
+              <th>ACTION</th>
+            </tr>
+          </thead>
+          <tbody id="editorHoldingsBody"></tbody>
+        </table>
+      </div>
+
+      <div class="editor-footer">
+        <div class="editor-summary">Allocation Total: <span id="editorAllocTotal">0.00%</span> (target 100%)</div>
+        <div class="editor-actions">
+          <button id="editorAddRow" class="calc-btn" type="button">+ Add Holding</button>
+          <button id="editorSave" class="calc-btn" type="button">Save Changes</button>
+          <button id="editorClearOverrideOne" class="editor-secondary" type="button" title="Remove manual price overrides for this portfolio's tickers">Clear Overrides (Portfolio)</button>
+          <button id="editorClearOverrideAll" class="editor-secondary" type="button" title="Remove all manual price overrides">Clear All Overrides</button>
+          <button id="editorResetOne" class="editor-secondary" type="button">Reset Portfolio</button>
+          <button id="editorResetAll" class="editor-secondary" type="button">Reset All</button>
+        </div>
+        <div class="editor-actions editor-file-actions">
+          <button id="editorExportJS" class="calc-btn editor-export-btn" type="button" title="Download an updated portfolio-data.js — replace your current file to persist changes">&#8595; Export portfolio-data.js</button>
+          <button id="editorExportJSON" class="editor-secondary" type="button" title="Download a JSON backup you can import on any device">&#8595; Export JSON backup</button>
+          <label class="editor-import-label" title="Import a previously exported .js or .json file">
+            &#8593; Import file&hellip;
+            <input id="editorImportFile" type="file" accept=".js,.json" />
+          </label>
+        </div>
+      </div>
+      <div id="editorStatus" class="editor-status">Ready. <span class="editor-persist-hint">Tip: click &ldquo;Export portfolio-data.js&rdquo; after saving to persist changes across reloads.</span></div>
+    </div>
+  `;
+
+  renderEditorRows(state.editorPortfolioKey);
+
+  document.getElementById('editorPortfolioSelect').addEventListener('change', e => {
+    state.editorPortfolioKey = e.target.value;
+    renderPortfolioEditor();
+  });
+
+  document.getElementById('editorAddRow').addEventListener('click', () => {
+    const tbody = document.getElementById('editorHoldingsBody');
+    tbody.insertAdjacentHTML('beforeend', editorHoldingRowHTML({ alloc: 0, shares: 0, costBasis: 0 }));
+    updateEditorTotals();
+    const count = document.querySelectorAll('#editorHoldingsBody tr').length;
+    setEditorStatus(`Added new holding row. ${count} rows in this portfolio.`, true);
+  });
+
+  document.getElementById('editorHoldingsBody').addEventListener('click', e => {
+    if (!e.target.classList.contains('editor-remove')) return;
+    e.target.closest('tr')?.remove();
+    updateEditorTotals();
+  });
+
+  document.getElementById('editorHoldingsBody').addEventListener('input', updateEditorTotals);
+
+  document.getElementById('editorSave').addEventListener('click', async () => {
+    setEditorStatus('Save started… validating rows.', true);
+    const portKey = state.editorPortfolioKey;
+    const previousTickers = new Set(PORTFOLIOS[portKey].holdings.map(h => String(h.ticker || '').toUpperCase()));
+    const rows = getEditorRows();
+    const accountValue = Number(document.getElementById('editorAccountValue').value || 0);
+    if (!rows.length) {
+      setEditorStatus('At least one holding is required.', false);
+      return;
+    }
+    const sanitizedRows = rows.map(r => coerceHolding(r)).filter(Boolean);
+    if (sanitizedRows.length !== rows.length) {
+      setEditorStatus('Each row needs a ticker, name, and valid numeric values.', false);
+      return;
+    }
+
+    PORTFOLIOS[portKey].accountValue = Number.isFinite(accountValue) && accountValue >= 0 ? accountValue : 0;
+    PORTFOLIOS[portKey].holdings = sanitizedRows;
+
+    // Remove stale overrides for tickers no longer present in this portfolio.
+    previousTickers.forEach(ticker => delete state.priceOverrides[ticker]);
+
+    // Apply / clear price overrides from the editor columns
+    rows.forEach(row => {
+      if (!row.ticker) return;
+      const p = row.manualPrice;
+      const pc = row.manualPrevClose;
+      if (p != null && Number.isFinite(p) && p > 0) {
+        state.priceOverrides[row.ticker] = {
+          price: p,
+          prevClose: (pc != null && Number.isFinite(pc) && pc > 0) ? pc : null,
+          updatedAt: new Date().toISOString(),
+        };
+      } else {
+        delete state.priceOverrides[row.ticker];
+      }
+    });
+
+    syncTickerCatalog();
+    savePortfolioData();
+
+    let refreshed = true;
+    try { await loadAllPrices(); } catch { refreshed = false; }
+    const manualCount = Object.keys(state.priceOverrides).length;
+    setEditorStatus(`Saved ${sanitizedRows.length} holdings for ${PORTFOLIOS[portKey].name}. Manual overrides: ${manualCount}. Live refresh ${refreshed ? 'ok' : 'deferred'}.`, true);
+    renderEditorRows(portKey); // refresh source badges
+  });
+
+  document.getElementById('editorClearOverrideOne').addEventListener('click', () => {
+    setEditorStatus('Clearing manual overrides for selected portfolio…', true);
+    const portKey = state.editorPortfolioKey;
+    let cleared = 0;
+    PORTFOLIOS[portKey].holdings.forEach(h => {
+      if (state.priceOverrides[h.ticker]) cleared += 1;
+    });
+    PORTFOLIOS[portKey].holdings.forEach(h => delete state.priceOverrides[h.ticker]);
+    savePortfolioData();
+    renderEditorRows(portKey);
+    setEditorStatus(`Cleared ${cleared} manual override(s) for ${PORTFOLIOS[portKey].name}.`, true);
+  });
+
+  document.getElementById('editorClearOverrideAll').addEventListener('click', () => {
+    setEditorStatus('Clearing all manual overrides…', true);
+    const cleared = Object.keys(state.priceOverrides).length;
+    state.priceOverrides = {};
+    savePortfolioData();
+    renderEditorRows(state.editorPortfolioKey);
+    setEditorStatus(`Cleared all manual overrides (${cleared} ticker${cleared === 1 ? '' : 's'}).`, true);
+  });
+
+  document.getElementById('editorResetOne').addEventListener('click', () => {
+    setEditorStatus('Resetting selected portfolio to defaults…', true);
+    resetPortfolioData(state.editorPortfolioKey);
+    renderPortfolioEditor();
+    setEditorStatus('Selected portfolio reset to defaults.', true);
+  });
+
+  document.getElementById('editorResetAll').addEventListener('click', () => {
+    setEditorStatus('Resetting all portfolios to defaults…', true);
+    resetPortfolioData();
+    renderPortfolioEditor();
+    setEditorStatus('All portfolios reset to defaults.', true);
+  });
+
+  document.getElementById('editorExportJS').addEventListener('click', () => {
+    setEditorStatus('Export started: building portfolio-data.js…', true);
+    exportPortfolioJS();
+    const holdingsTotal = Object.values(PORTFOLIOS).reduce((sum, p) => sum + p.holdings.length, 0);
+    setEditorStatus(`Export complete: portfolio-data.js downloaded (${holdingsTotal} holdings). Replace your existing file to persist.`, true);
+  });
+
+  document.getElementById('editorExportJSON').addEventListener('click', () => {
+    setEditorStatus('Export started: building JSON backup…', true);
+    exportPortfolioJSON();
+    setEditorStatus('Export complete: portfolio-data.json downloaded.', true);
+  });
+
+  document.getElementById('editorImportFile').addEventListener('change', async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setEditorStatus(`Import started: reading ${file.name}…`, true);
+    try {
+      setEditorStatus(`Import parsing: validating ${file.name}…`, true);
+      await importPortfolioFile(file);
+      const holdingsTotal = Object.values(PORTFOLIOS).reduce((sum, p) => sum + p.holdings.length, 0);
+      const overrideTotal = Object.keys(state.priceOverrides).length;
+      renderPortfolioEditor();
+      setEditorStatus(`Import complete: ${file.name} loaded (${holdingsTotal} holdings, ${overrideTotal} manual override${overrideTotal === 1 ? '' : 's'}).`, true);
+    } catch (err) {
+      setEditorStatus(`Import failed: ${err.message}`, false);
+    }
+    e.target.value = '';
+  });
+}
+
 function renderIRAPage(portKey) {
   const port  = PORTFOLIOS[portKey];
   const r90   = calcPortfolio90Return(portKey);
@@ -762,14 +1649,14 @@ function renderIRAPage(portKey) {
   document.getElementById('mainContent').innerHTML = `
     <div class="page-header">
       <h1>${port.name}</h1>
-      <div class="subtitle">Live prices · 90-day window Dec 17, 2025 – Mar 26, 2026</div>
+      <div class="subtitle">Live prices · 90-day window ${window90Label()}</div>
     </div>
 
     <div class="ira-stats-row">
       <div class="stat-card">
         <div class="stat-label">ACCOUNT VALUE</div>
         <div class="stat-value">${fmt$(port.accountValue)}</div>
-        <div class="stat-sub">as of Mar 26, 2026</div>
+        <div class="stat-sub">as of ${todayLabel()}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">90-DAY RETURN</div>
@@ -797,7 +1684,7 @@ function renderIRAPage(portKey) {
     <div class="ira-charts-row">
       <div class="chart-card">
         <div class="chart-title">90-Day Normalized Performance — ${port.name}</div>
-        <div class="chart-subtitle">Base = 100 · Dec 17, 2025 → Mar 26, 2026</div>
+        <div class="chart-subtitle">Base = 100 · ${window90Label()}</div>
         <div class="chart-wrap"><canvas id="iraLineChart" style="max-height:220px"></canvas></div>
       </div>
       <div class="chart-card">
@@ -868,7 +1755,7 @@ function renderRothIRA() {
   document.getElementById('mainContent').innerHTML = `
     <div class="page-header">
       <h1>Roth IRA</h1>
-      <div class="subtitle">Live prices · 90-day window Dec 17, 2025 – Mar 26, 2026</div>
+      <div class="subtitle">Live prices · 90-day window ${window90Label()}</div>
     </div>
 
     <div class="outperform-banner" style="border-color:rgba(74,158,255,.35);background:rgba(74,158,255,.07);color:var(--accent-blue)">
@@ -879,7 +1766,7 @@ function renderRothIRA() {
       <div class="stat-card">
         <div class="stat-label">ACCOUNT VALUE</div>
         <div class="stat-value">${fmt$(port.accountValue)}</div>
-        <div class="stat-sub">as of Mar 26, 2026</div>
+        <div class="stat-sub">as of ${todayLabel()}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">90-DAY RETURN</div>
@@ -905,7 +1792,7 @@ function renderRothIRA() {
     <div class="ira-charts-row">
       <div class="chart-card">
         <div class="chart-title">90-Day Normalized Performance — Roth IRA</div>
-        <div class="chart-subtitle">Base = 100 · Dec 17, 2025 → Mar 26, 2026</div>
+        <div class="chart-subtitle">Base = 100 · ${window90Label()}</div>
         <div class="chart-wrap"><canvas id="rothLineChart" style="max-height:220px"></canvas></div>
       </div>
       <div class="chart-card">
@@ -1307,18 +2194,18 @@ function renderAlerts() {
   const alerts = [
     { sev: 'critical', title: 'Strait of Hormuz partially blockaded', body: 'Iran preventing tanker passage; ~20% of global oil supply affected.  The strait handles ~21% of global petroleum liquids trade. Dubai and Doha airports had peak suspensions due to missile threat proximity.', source: 'Mar 18, 2026 · Bloomberg', icon: '🚨' },
     { sev: 'critical', title: 'Ali Larijani confirmed killed', body: 'Former Iranian parliament speaker and senior IRGC political liaison Ali Larijani confirmed killed March 18, 2026 in a targeted strike. Elevates succession uncertainty and hardliner control risk.', source: 'Mar 19, 2026 · Reuters / ACLED', icon: '💀' },
-    { sev: 'high',     title: 'PDBC +28.24% since Dec 17 — commodity surge', body: 'Invesco Optimum Yield Diversified Commodity Strategy (PDBC), your 8% Rollover IRA sleeve, is up 28.24% since portfolio inception Dec 17, 2025. Crude, natural gas, and agricultural commodities all elevated. UBS CIO recommends maintaining exposure through at least Q2 2026.', source: 'Mar 2, 2026 · UBS Global CIO', icon: '📈' },
-    { sev: 'high',     title: 'GLDM +12.41% — gold crisis hedge activated', body: 'Gold MiniShares (GLDM), held in Traditional IRA (15%) and Roth IRA (5%), is up 12.41% over 90 days. Gold has outperformed the S&P 500 by 14.63% over the same period, functioning exactly as intended.', source: 'Mar 26, 2026 · Market Data', icon: '🥇' },
+    { sev: 'high',     title: 'PDBC +28.24% since Dec 17 — commodity surge', body: 'Invesco Optimum Yield Diversified Commodity Strategy (PDBC), your 8% Rollover IRA sleeve, is up 28.24% since portfolio inception Dec 17, 2025. Crude, natural gas, and agricultural commodities all elevated. UBS CIO recommends maintaining exposure through at least Q2 2026.', source: `${daysAgoLabel(66)} · UBS Global CIO`, icon: '📈' },
+    { sev: 'high',     title: 'GLDM +12.41% — gold crisis hedge activated', body: 'Gold MiniShares (GLDM), held in Traditional IRA (15%) and Roth IRA (5%), is up 12.41% over 90 days. Gold has outperformed the S&P 500 by 14.63% over the same period, functioning exactly as intended.', source: `${todayLabel()} · Market Data`, icon: '🥇' },
     { sev: 'high',     title: 'Oil embargo escalation risk — $120+ scenario', body: 'If Hormuz blockade persists through April, crude oil could reach $120+/bbl per Goldman Sachs and energy desk estimates. This would be strongly positive for PDBC and GLDM, and negative for growth equities (XLK, SMH).', source: 'Mar 20, 2026 · Goldman Sachs Energy Research', icon: '🛢️' },
     { sev: 'medium',   title: 'Market risk premium repriced — 106bps per 10-pt stability drop', body: 'PRS Group ICRG data shows sovereign spread increase of 106bps per 10-point political-stability drop. Iran\'s score dropped from 48 to 29 (scale 0-100). Al Jazeera\'s economic desk warns of global recession risk if Hormuz remains blocked through Q3 2026.', source: 'Mar 17, 2026 · PRS Group / Al Jazeera', icon: '⚠️' },
-    { sev: 'medium',   title: 'XLK and SMH under technical pressure', body: 'Technology (XLK -3.2% 90-day) and Semiconductors (SMH -4.8% 90-day) are underperforming due to rate sensitivity, oil-input cost increases, and Taiwan supply chain uncertainty exacerbated by Middle East instability.', source: 'Mar 26, 2026 · Technical Analysis', icon: '💻' },
+    { sev: 'medium',   title: 'XLK and SMH under technical pressure', body: 'Technology (XLK -3.2% 90-day) and Semiconductors (SMH -4.8% 90-day) are underperforming due to rate sensitivity, oil-input cost increases, and Taiwan supply chain uncertainty exacerbated by Middle East instability.', source: `${todayLabel()} · Technical Analysis`, icon: '💻' },
     { sev: 'low',      title: 'VTIP inflation protection activation confirmed', body: 'Vanguard Short-Term TIPS (VTIP) up 1.8% 90-day as anticipated inflation premium baked in. CPI for March expected to print above 3.4% annualized due to energy pass-through.', source: 'Mar 15, 2026 · Federal Reserve / BLS', icon: '🏦' },
   ];
 
   document.getElementById('mainContent').innerHTML = `
     <div class="page-header">
       <h1>Iran Crisis Alerts</h1>
-      <div class="subtitle">Operation Epic Fury — Live geopolitical situation report · Mar 26, 2026</div>
+      <div class="subtitle">Operation Epic Fury — Live geopolitical situation report · ${todayLabel()}</div>
     </div>
 
     <div class="alerts-list">
@@ -1349,10 +2236,10 @@ function renderBenchmarks() {
   const incR  = calcPortfolio90Return('income');
 
   const benchData = [
-    { label: 'DOW JONES', price: dow.price,    day: dow.dayChangePct,    r90: -3.28, range: BENCHMARKS['^DJI'].range52  },
-    { label: 'S&P 500',   price: sp500.price,  day: sp500.dayChangePct,  r90: -2.22, range: BENCHMARKS['^GSPC'].range52 },
-    { label: 'NASDAQ',    price: nasdaq.price, day: nasdaq.dayChangePct, r90: -4.12, range: BENCHMARKS['^IXIC'].range52 },
-    { label: 'GOLD / OZ', price: gold.price,   day: gold.dayChangePct,   r90:  4.18, range: BENCHMARKS['GC=F'].range52  },
+    { label: 'DOW JONES', symbol: '^DJI',  price: dow.price,    day: dow.dayChangePct,    r90: -3.28, range: BENCHMARKS['^DJI'].range52  },
+    { label: 'S&P 500',   symbol: '^GSPC', price: sp500.price,  day: sp500.dayChangePct,  r90: -2.22, range: BENCHMARKS['^GSPC'].range52 },
+    { label: 'NASDAQ',    symbol: '^IXIC', price: nasdaq.price, day: nasdaq.dayChangePct, r90: -4.12, range: BENCHMARKS['^IXIC'].range52 },
+    { label: 'GOLD / OZ', symbol: 'GC=F',  price: gold.price,   day: gold.dayChangePct,   r90:  4.18, range: BENCHMARKS['GC=F'].range52  },
   ];
 
   document.getElementById('mainContent').innerHTML = `
@@ -1364,7 +2251,10 @@ function renderBenchmarks() {
     <div class="benchmark-grid" style="margin-bottom:1.5rem">
       ${benchData.map(b => `
         <div class="bench-card">
-          <div class="bench-label">${b.label}</div>
+          <div class="bench-head-row">
+            <div class="bench-label">${b.label}</div>
+            <span class="bench-source-badge source-${getBenchSource(b.symbol)}">${getBenchSource(b.symbol).toUpperCase()}</span>
+          </div>
           <div class="bench-price">${fmtN(b.price)}</div>
           <div class="bench-change ${b.day < 0 ? 'down' : 'up'}">
             ${b.day < 0 ? '▼' : '▲'} ${Math.abs(b.day).toFixed(2)}% today
@@ -1379,7 +2269,7 @@ function renderBenchmarks() {
 
     <div class="chart-card" style="margin-bottom:1.5rem">
       <div class="chart-title">IRA vs Benchmark — 90-Day Normalized</div>
-      <div class="chart-subtitle">Dec 17, 2025 → Mar 26, 2026 · Base = 100</div>
+      <div class="chart-subtitle">${window90Label()} · Base = 100</div>
       <div class="chart-wrap"><canvas id="benchNormChart"></canvas></div>
     </div>
 
@@ -1839,6 +2729,7 @@ function navigateTo(page) {
     case 'roth':        renderRothIRA();     break;
     case 'investments': renderInvestments(); break;
     case 'income':      renderIncome();      break;
+    case 'editor':      renderPortfolioEditor(); break;
     case 'rebalance':   renderRebalance();   break;
     case 'benchmarks':  renderBenchmarks();  break;
     case 'alerts':      renderAlerts();      break;
@@ -1846,6 +2737,9 @@ function navigateTo(page) {
     case 'insights':    renderInsights();    break;
     default:            renderOverview();
   }
+
+  renderWarNews();
+  updateDiagnosticsStrip();
 
   // Scroll to top
   document.getElementById('mainContent').scrollTop = 0;
@@ -1855,7 +2749,7 @@ function navigateTo(page) {
 function updateSnapshotTime() {
   const now = new Date();
   const utc = now.toUTCString().replace('GMT','UTC');
-  // Format: Snapshot — Mar 26, 2026, 19:13 UTC
+  // Format: Snapshot — May 7, 2026, 19:13 UTC (dynamic)
   const parts = now.toLocaleString('en-US', {
     timeZone: 'UTC', month:'short', day:'numeric', year:'numeric',
     hour:'2-digit', minute:'2-digit', hour12: false, timeZoneName:'short'
@@ -1871,8 +2765,10 @@ function calcRebalanceDays() {
 }
 
 async function init() {
+  loadPortfolioData();
   updateSnapshotTime();
   calcRebalanceDays();
+  updateDiagnosticsStrip();
 
   // Nav links
   document.querySelectorAll('.nav-link').forEach(el => {
@@ -1902,22 +2798,66 @@ async function init() {
       document.body.classList.contains('light-mode') ? '☀' : '☽';
   });
 
+  const refreshMarketsBtn = document.getElementById('refreshMarketsBtn');
+  const refreshNewsBtn = document.getElementById('refreshNewsBtn');
+  if (refreshMarketsBtn) refreshMarketsBtn.addEventListener('click', refreshMarketsNow);
+  if (refreshNewsBtn) refreshNewsBtn.addEventListener('click', refreshNewsNow);
+
   // Render overview immediately with seed data
   renderOverview();
+  renderWarNews();
 
-  // Then fetch live prices in background and re-render current page
-  try {
-    await loadAllPrices();
-  } catch { /* already seeded */ }
+  // Fetch benchmarks first so Dow/S&P/NASDAQ/Gold flip to live quickly.
+  loadBenchmarkPrices()
+    .catch(() => { /* silent */ })
+    .finally(() => {
+      state.diagnostics.lastMarketsRefreshAt = new Date().toISOString();
+      state.diagnostics.lastMarketsError = null;
+      navigateTo(state.currentPage);
+    });
 
-  // Re-render current page with (possibly updated) live prices
-  navigateTo(state.currentPage);
+  // Fetch full ticker set in background without blocking the UI.
+  loadAllPrices()
+    .catch(() => { /* silent */ })
+    .finally(() => {
+      state.diagnostics.lastMarketsRefreshAt = new Date().toISOString();
+      state.diagnostics.lastMarketsError = null;
+      navigateTo(state.currentPage);
+    });
+
+  // Load conflict headlines in background (do not block live price paint).
+  loadWarNews();
 
   // Refresh prices every 5 minutes
   setInterval(async () => {
-    try { await loadAllPrices(); } catch { /* silent */ }
+    try {
+      await loadAllPrices();
+      state.diagnostics.lastMarketsRefreshAt = new Date().toISOString();
+      state.diagnostics.lastMarketsError = null;
+    } catch {
+      state.diagnostics.lastMarketsError = 'auto refresh failed';
+    }
     navigateTo(state.currentPage);
   }, 5 * 60 * 1000);
+
+  // Keep benchmark cards fresh between full refresh cycles.
+  setInterval(async () => {
+    try {
+      await loadBenchmarkPrices();
+      state.diagnostics.lastMarketsRefreshAt = new Date().toISOString();
+      state.diagnostics.lastMarketsError = null;
+    } catch {
+      state.diagnostics.lastMarketsError = 'benchmark refresh failed';
+    }
+    if (state.currentPage === 'overview' || state.currentPage === 'benchmarks') {
+      navigateTo(state.currentPage);
+    }
+  }, 60 * 1000);
+
+  // Refresh war headlines every 15 minutes
+  setInterval(() => {
+    loadWarNews();
+  }, 15 * 60 * 1000);
 
   // Clock tick every minute
   setInterval(updateSnapshotTime, 60 * 1000);

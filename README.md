@@ -257,6 +257,39 @@ index.html
 
 Prices refresh automatically every **5 minutes** while the page is open. The timestamp in the header shows the last update time in UTC. The `Snapshot` badge turns stale if the browser tab is left idle, but re-fetches on the next interval.
 
+You can also force refresh at any time from the header:
+- `Refresh Markets` — immediately fetches benchmark + holdings quotes
+- `Refresh News` — immediately refreshes conflict headlines
+
+The header diagnostics strip shows live health at a glance:
+- `Bench x/4` = number of benchmark feeds currently live
+- `Holdings x/18` = number of holdings with live quotes
+- `News LIVE/SEED` = current war-news source
+
+Hover the diagnostics strip to see last refresh times and any recent fallback reason.
+
+---
+
+## Local App Launcher (Windows)
+
+For the most reliable Edge experience (including cleaner CORS behavior), use the included launcher scripts.
+
+### One-click launch
+
+1. Double-click `launch-dashboard.cmd`
+2. It starts a lightweight local server on `127.0.0.1:5510`
+3. It opens Edge in app-window mode with a cache-busting URL
+
+### Stop the local server
+
+- Run `stop-dashboard-server.cmd`
+
+### Optional desktop shortcut
+
+Create a desktop shortcut that points to:
+
+`C:\Users\aladi\VScode_Projects\IRA_Tracker_Dashboard\launch-dashboard.cmd`
+
 ---
 
 ## Seed Data vs Live Data
