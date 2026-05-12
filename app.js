@@ -2636,17 +2636,20 @@ function renderDividends() {
 
 function buildRebalTable(portKey) {
   const port   = PORTFOLIOS[portKey];
-  const total  = port.accountValue;
   const holdings = port.holdings.filter(h => h.alloc > 0);
+
+  const totalMktVal = holdings.reduce((sum, h) => {
+    return sum + (getPrice(h.ticker) * h.shares);
+  }, 0);
 
   const rows = holdings.map(h => {
     const price       = getPrice(h.ticker);
     const currentVal  = price * h.shares;
     const costVal     = h.costBasis * h.shares;
     const gainLoss    = currentVal - costVal;
-    const gainLossPct = ((price - h.costBasis) / h.costBasis) * 100;
-    const targetVal   = total * (h.alloc / 100);
-    const currentPct  = (currentVal / total) * 100;
+    const gainLossPct = h.costBasis > 0 ? ((price - h.costBasis) / h.costBasis) * 100 : 0;
+    const targetVal   = totalMktVal * (h.alloc / 100);
+    const currentPct  = totalMktVal > 0 ? (currentVal / totalMktVal) * 100 : 0;
     const drift       = currentPct - h.alloc;
     const deltaVal    = targetVal - currentVal;
     const sharesNeeded = deltaVal / price;
@@ -2654,10 +2657,9 @@ function buildRebalTable(portKey) {
   });
 
   // Portfolio totals
-  const totalMktVal  = rows.reduce((s, r) => s + r.currentVal, 0);
   const totalCostVal = holdings.reduce((s, h) => s + h.costBasis * h.shares, 0);
   const totalGL      = totalMktVal - totalCostVal;
-  const totalGLPct   = (totalGL / totalCostVal) * 100;
+  const totalGLPct   = totalCostVal > 0 ? (totalGL / totalCostVal) * 100 : 0;
 
   return `
     <div class="rb-port-value">Total Portfolio Value: <span>${fmt$(totalMktVal)}</span>
