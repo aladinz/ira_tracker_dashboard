@@ -2636,11 +2636,12 @@ function renderDividends() {
 
 function buildRebalTable(portKey) {
   const port   = PORTFOLIOS[portKey];
-  const holdings = port.holdings.filter(h => h.alloc > 0);
+  const holdings = port.holdings.filter(h => h.alloc > 0 || h.shares > 0);
 
   const totalMktVal = holdings.reduce((sum, h) => {
     return sum + (getPrice(h.ticker) * h.shares);
   }, 0);
+  const targetAllocTotal = holdings.reduce((sum, h) => sum + Math.max(0, h.alloc), 0);
 
   const rows = holdings.map(h => {
     const price       = getPrice(h.ticker);
@@ -2648,12 +2649,13 @@ function buildRebalTable(portKey) {
     const costVal     = h.costBasis * h.shares;
     const gainLoss    = currentVal - costVal;
     const gainLossPct = h.costBasis > 0 ? ((price - h.costBasis) / h.costBasis) * 100 : 0;
-    const targetVal   = totalMktVal * (h.alloc / 100);
+    const targetPct   = targetAllocTotal > 0 ? (Math.max(0, h.alloc) / targetAllocTotal) * 100 : 0;
+    const targetVal   = totalMktVal * (targetPct / 100);
     const currentPct  = totalMktVal > 0 ? (currentVal / totalMktVal) * 100 : 0;
-    const drift       = currentPct - h.alloc;
+    const drift       = currentPct - targetPct;
     const deltaVal    = targetVal - currentVal;
-    const sharesNeeded = deltaVal / price;
-    return { ticker: h.ticker, shares: h.shares, costBasis: h.costBasis, price, currentVal, gainLoss, gainLossPct, targetPct: h.alloc, currentPct, drift, sharesNeeded, deltaVal };
+    const sharesNeeded = price > 0 ? deltaVal / price : 0;
+    return { ticker: h.ticker, shares: h.shares, costBasis: h.costBasis, price, currentVal, gainLoss, gainLossPct, targetPct, currentPct, drift, sharesNeeded, deltaVal };
   });
 
   // Portfolio totals
